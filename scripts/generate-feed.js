@@ -20,6 +20,7 @@ import { join } from "path";
 // -- Constants ---------------------------------------------------------------
 
 const POD2TXT_BASE = "https://pod2txt.vercel.app/api";
+const SUPADATA_BASE = "https://api.supadata.ai/v1";
 const X_API_BASE = "https://api.x.com/2";
 // Some RSS hosts (notably Substack) block non-browser user agents from cloud IPs.
 // Using a real Chrome UA avoids 403 errors in GitHub Actions.
@@ -28,8 +29,10 @@ const RSS_USER_AGENT =
 const TWEET_LOOKBACK_HOURS = 24;
 const PODCAST_LOOKBACK_HOURS = 336; // 14 days — podcasts publish weekly/biweekly, not daily
 const BLOG_LOOKBACK_HOURS = 72;
+const YOUTUBE_LOOKBACK_HOURS = 48; // catch yesterday's uploads for the next-morning digest
 const MAX_TWEETS_PER_USER = 3;
 const MAX_ARTICLES_PER_BLOG = 3;
+const MAX_VIDEOS_PER_CHANNEL = 1; // newest unseen video per channel per run (keeps transcript credits low)
 const X_USER_LOOKUP_BATCH_SIZE = 5;
 const X_RETRY_STATUSES = new Set([500, 502, 503, 504]);
 const X_RETRY_ATTEMPTS = 3;
@@ -913,6 +916,8 @@ async function fetchBlogContent(blogs, state, errors) {
         candidates = parseAnthropicEngineeringIndex(indexHtml);
       } else if (blog.indexUrl.includes("claude.com")) {
         candidates = parseClaudeBlogIndex(indexHtml);
+      } else if (blog.indexUrl.includes("pi.website")) {
+        candidates = parsePiBlogIndex(indexHtml);
       }
 
       // Step 2: Filter to unseen articles, cap at MAX_ARTICLES_PER_BLOG.
@@ -962,6 +967,8 @@ async function fetchBlogContent(blogs, state, errors) {
             extracted = extractAnthropicArticleContent(articleHtml);
           } else if (article.url.includes("claude.com/blog")) {
             extracted = extractClaudeBlogArticleContent(articleHtml);
+          } else if (article.url.includes("pi.website")) {
+            extracted = extractPiArticleContent(articleHtml);
           }
 
           if (!extracted || !extracted.content) {
@@ -1000,6 +1007,200 @@ async function fetchBlogContent(blogs, state, errors) {
   return results;
 }
 
+// -- YouTube Channel Fetching (free RSS discovery + Supadata transcripts) ----
+
+// Parses a YouTube channel Atom feed into {videoId, title, publishedAt}.
+// Richer than parseYouTubeFeed (which only returns title+url) because the
+// channel digest needs the video id, publish date, and dedup key.
+function parseYouTubeChannelAtom(xml) {
+  const out = [];
+  const re = /<entry>([\s\S]*?)<\/entry>/g;
+  let m;
+  while ((m = re.exec(xml)) !== null) {
+    const b = m[1];
+    const vid = (b.match(/<yt:videoId>([\s\S]*?)<\/yt:videoId>/) || [])[1];
+    const title = (b.match(/<title>([\s\S]*?)<\/title>/) || [])[1];
+    const published = (b.match(/<published>([\s\S]*?)<\/published>/) || [])[1];
+    if (vid) {
+      out.push({
+        videoId: vid.trim(),
+        title: (title || "").trim(),
+        publishedAt: published ? new Date(published.trim()).toISOString() : null,
+      });
+    }
+  }
+  return out;
+}
+
+// Polls a Supadata async transcript job (HTTP 202 path, used for long videos).
+async function pollSupadataJob(jobId, apiKey) {
+  for (let i = 0; i < 24; i++) {
+    await new Promise((r) => setTimeout(r, 5000));
+    const res = await fetch(`${SUPADATA_BASE}/transcript/${jobId}`, {
+      headers: { "x-api-key": apiKey },
+    });
+    if (!res.ok) continue;
+    const d = await res.json();
+    const c = d.content ?? d.result?.content;
+    if (d.status === "completed" || c) {
+      if (typeof c === "string" && c.trim()) return { transcript: c };
+      if (Array.isArray(c)) return { transcript: c.map((x) => x.text).join(" ") };
+    }
+    if (d.status === "failed" || d.error) {
+      return { error: d.error || "transcript job failed" };
+    }
+  }
+  return { error: "transcript job timed out" };
+}
+
+// Fetches a transcript for a YouTube video via Supadata. Uses mode=native
+// (the video's own / auto captions = 1 credit) to stay inside the free tier.
+// Handles both the sync (200) and async (202 + jobId, for >20 min videos) paths.
+async function fetchSupadataTranscript(videoUrl, apiKey) {
+  try {
+    const res = await fetch(
+      `${SUPADATA_BASE}/transcript?url=${encodeURIComponent(videoUrl)}&text=true&mode=native`,
+      { headers: { "x-api-key": apiKey } },
+    );
+    if (res.status === 202) {
+      const { jobId } = await res.json();
+      if (!jobId) return { error: "202 without jobId" };
+      return await pollSupadataJob(jobId, apiKey);
+    }
+    if (!res.ok) {
+      const t = await res.text().catch(() => "");
+      return { error: `HTTP ${res.status}: ${t.slice(0, 200)}` };
+    }
+    const data = await res.json();
+    if (typeof data.content === "string" && data.content.trim())
+      return { transcript: data.content };
+    if (Array.isArray(data.content))
+      return { transcript: data.content.map((c) => c.text).join(" ") };
+    return { error: data.error || "no transcript content" };
+  } catch (err) {
+    return { error: err.message };
+  }
+}
+
+// Main YouTube fetching function. For each channel:
+// 1. Discovers recent videos from the channel's free Atom RSS feed (no key)
+// 2. Filters by lookback window + dedup against seenVideos
+// 3. Fetches a transcript via Supadata for the newest unseen video(s)
+async function fetchYouTubeChannelContent(channels, apiKey, state, errors) {
+  const results = [];
+  const cutoff = new Date(Date.now() - YOUTUBE_LOOKBACK_HOURS * 60 * 60 * 1000);
+
+  for (const ch of channels) {
+    try {
+      console.error(`  YouTube: ${ch.name}...`);
+      const feedUrl = await getYouTubeFeedUrl(ch.url);
+      if (!feedUrl) {
+        errors.push(`YouTube: could not resolve channel feed for ${ch.name}`);
+        continue;
+      }
+      const res = await fetch(feedUrl, {
+        headers: { "User-Agent": RSS_USER_AGENT },
+        signal: AbortSignal.timeout(15000),
+      });
+      if (!res.ok) {
+        errors.push(`YouTube: feed HTTP ${res.status} for ${ch.name}`);
+        continue;
+      }
+      const entries = parseYouTubeChannelAtom(await res.text());
+      // Atom lists newest first. Keep unseen entries within the lookback window.
+      const fresh = entries
+        .filter((e) => !state.seenVideos[e.videoId])
+        .filter((e) => !e.publishedAt || new Date(e.publishedAt) >= cutoff);
+
+      let taken = 0;
+      for (const e of fresh) {
+        if (taken >= MAX_VIDEOS_PER_CHANNEL) break;
+        const videoUrl = `https://www.youtube.com/watch?v=${e.videoId}`;
+        console.error(`    Fetching transcript: "${e.title}"`);
+        const t = await fetchSupadataTranscript(videoUrl, apiKey);
+        state.seenVideos[e.videoId] = Date.now(); // mark seen regardless of outcome
+        if (t.error || !t.transcript) {
+          errors.push(
+            `YouTube: no transcript for "${e.title}" (${ch.name}): ${t.error || "empty"}`,
+          );
+          continue;
+        }
+        console.error(`    Got transcript (${t.transcript.length} chars)`);
+        results.push({
+          source: "youtube",
+          name: ch.name,
+          channel: ch.url,
+          title: e.title,
+          url: videoUrl,
+          publishedAt: e.publishedAt,
+          transcript: t.transcript,
+        });
+        taken++;
+        await new Promise((r) => setTimeout(r, 300));
+      }
+    } catch (err) {
+      errors.push(`YouTube: error for ${ch.name}: ${err.message}`);
+    }
+  }
+  return results;
+}
+
+// -- Physical Intelligence blog (pi.website) scraping ------------------------
+// pi.website is a client-light static site: no __NEXT_DATA__/JSON-LD, posts
+// live under /blog/<slug> and /research/<slug>. We pull the slug links from
+// the index and strip the article HTML to text (the raw HTML is server-rendered
+// and yields the full article body).
+
+function parsePiBlogIndex(html) {
+  const articles = [];
+  const seen = new Set();
+  const re = /href="(\/(?:blog|research)\/[A-Za-z0-9_-]+)"/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    const path = m[1];
+    if (seen.has(path)) continue;
+    seen.add(path);
+    articles.push({
+      title: "",
+      url: "https://pi.website" + path,
+      publishedAt: null,
+      description: "",
+    });
+  }
+  return articles;
+}
+
+function extractPiArticleContent(html) {
+  let title = "";
+  const h1 = html.match(/<h1[^>]*>([\s\S]*?)<\/h1>/i);
+  if (h1) title = h1[1].replace(/<[^>]+>/g, "").trim();
+
+  let publishedAt = null;
+  const pm = html.match(/Published\s+([A-Z][a-z]+ \d{1,2},? \d{4})/);
+  if (pm) {
+    const d = new Date(pm[1]);
+    if (!isNaN(d)) publishedAt = d.toISOString();
+  }
+
+  const content = html
+    .replace(/<script[\s\S]*?<\/script>/gi, "")
+    .replace(/<style[\s\S]*?<\/style>/gi, "")
+    .replace(/<nav[\s\S]*?<\/nav>/gi, "")
+    .replace(/<header[\s\S]*?<\/header>/gi, "")
+    .replace(/<footer[\s\S]*?<\/footer>/gi, "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/&amp;/g, "&")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;/g, "'")
+    .replace(/&nbsp;/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  return { title, author: "", publishedAt, content };
+}
+
 // -- Main --------------------------------------------------------------------
 
 async function main() {
@@ -1007,15 +1208,19 @@ async function main() {
   const tweetsOnly = args.includes("--tweets-only");
   const podcastsOnly = args.includes("--podcasts-only");
   const blogsOnly = args.includes("--blogs-only");
+  const youtubeOnly = args.includes("--youtube-only");
 
-  // If a specific --*-only flag is set, only that feed type runs.
-  // If no flag is set, all three run.
-  const runTweets = tweetsOnly || (!podcastsOnly && !blogsOnly);
-  const runPodcasts = podcastsOnly || (!tweetsOnly && !blogsOnly);
-  const runBlogs = blogsOnly || (!tweetsOnly && !podcastsOnly);
+  // If any --*-only flag is set, only those feed types run.
+  // If no flag is set, all feed types run.
+  const anyOnly = tweetsOnly || podcastsOnly || blogsOnly || youtubeOnly;
+  const runTweets = anyOnly ? tweetsOnly : true;
+  const runPodcasts = anyOnly ? podcastsOnly : true;
+  const runBlogs = anyOnly ? blogsOnly : true;
+  const runYoutube = anyOnly ? youtubeOnly : true;
 
   const xBearerToken = process.env.X_BEARER_TOKEN;
   const pod2txtKey = process.env.POD2TXT_API_KEY;
+  const supadataKey = process.env.SUPADATA_API_KEY;
 
   if (runPodcasts && !pod2txtKey) {
     console.error("POD2TXT_API_KEY not set");
@@ -1023,6 +1228,10 @@ async function main() {
   }
   if (runTweets && !xBearerToken) {
     console.error("X_BEARER_TOKEN not set");
+    process.exit(1);
+  }
+  if (runYoutube && !supadataKey) {
+    console.error("SUPADATA_API_KEY not set");
     process.exit(1);
   }
 
@@ -1110,6 +1319,34 @@ async function main() {
       JSON.stringify(blogFeed, null, 2),
     );
     console.error(`  feed-blogs.json: ${blogContent.length} posts`);
+  }
+
+  // Fetch YouTube channel videos (free RSS discovery + Supadata transcripts)
+  if (runYoutube && sources.youtube && sources.youtube.length > 0) {
+    console.error("Fetching YouTube content (RSS + Supadata)...");
+    const youtube = await fetchYouTubeChannelContent(
+      sources.youtube,
+      supadataKey,
+      state,
+      errors,
+    );
+    console.error(`  Found ${youtube.length} new video(s) with transcripts`);
+
+    const youtubeFeed = {
+      generatedAt: new Date().toISOString(),
+      lookbackHours: YOUTUBE_LOOKBACK_HOURS,
+      youtube,
+      stats: { youtubeVideos: youtube.length },
+      errors:
+        errors.filter((e) => e.startsWith("YouTube")).length > 0
+          ? errors.filter((e) => e.startsWith("YouTube"))
+          : undefined,
+    };
+    await writeFile(
+      join(SCRIPT_DIR, "..", "feed-youtube.json"),
+      JSON.stringify(youtubeFeed, null, 2),
+    );
+    console.error(`  feed-youtube.json: ${youtube.length} videos`);
   }
 
   // Save dedup state

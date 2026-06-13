@@ -1,21 +1,25 @@
 name: Generate Feeds
 
+# This fork only self-hosts the BLOGS (incl. pi.website) and YOUTUBE feeds,
+# using the free Supadata key. X tweets + podcasts are pulled live from the
+# upstream central feed by prepare-digest.js, so no X / pod2txt keys are needed.
+
 on:
   schedule:
-    # All feeds (tweets, podcasts, blogs): once daily at 6:17am UTC
-    - cron: '17 6 * * *'
+    # Run at 22:00 UTC (06:00 Asia/Singapore) so feeds are fresh ~2h before
+    # the 08:00 SGT (00:00 UTC) digest delivery.
+    - cron: '0 22 * * *'
   workflow_dispatch:
     inputs:
       mode:
         description: 'What to fetch'
         required: false
-        default: 'all'
+        default: 'blogs+youtube'
         type: choice
         options:
-          - all
-          - tweets-only
-          - podcasts-only
+          - blogs+youtube
           - blogs-only
+          - youtube-only
 
 jobs:
   generate:
@@ -35,19 +39,23 @@ jobs:
 
       - name: Generate feeds
         env:
-          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
-          POD2TXT_API_KEY: ${{ secrets.POD2TXT_API_KEY }}
+          SUPADATA_API_KEY: ${{ secrets.SUPADATA_API_KEY }}
         run: |
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "${{ inputs.mode }}" != "all" ]; then
-            cd scripts && node generate-feed.js --${{ inputs.mode }}
+          MODE="${{ inputs.mode }}"
+          cd scripts
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$MODE" = "blogs-only" ]; then
+            node generate-feed.js --blogs-only
+          elif [ "${{ github.event_name }}" = "workflow_dispatch" ] && [ "$MODE" = "youtube-only" ]; then
+            node generate-feed.js --youtube-only
           else
-            cd scripts && node generate-feed.js
+            node generate-feed.js --blogs-only
+            node generate-feed.js --youtube-only
           fi
 
       - name: Commit and push feeds
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add feed-x.json feed-podcasts.json feed-blogs.json state-feed.json
+          git add feed-blogs.json feed-youtube.json state-feed.json
           git diff --cached --quiet || git commit -m "chore: update feeds [skip ci]"
           git push

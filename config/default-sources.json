@@ -45,7 +45,22 @@
       "indexUrl": "https://claude.com/blog",
       "articleBaseUrl": "https://claude.com/blog/",
       "fetchMethod": "http"
+    },
+    {
+      "name": "Physical Intelligence (π)",
+      "type": "scrape",
+      "indexUrl": "https://pi.website/blog",
+      "articleBaseUrl": "https://pi.website/",
+      "fetchMethod": "http"
     }
+  ],
+  "youtube": [
+    { "name": "Lex Fridman", "handle": "lexfridman", "url": "https://www.youtube.com/@lexfridman" },
+    { "name": "Dwarkesh Patel", "handle": "DwarkeshPatel", "url": "https://www.youtube.com/@DwarkeshPatel" },
+    { "name": "Stanford Online", "handle": "stanfordonline", "url": "https://www.youtube.com/@stanfordonline" },
+    { "name": "Andrei Jikh", "handle": "AndreiJikh", "url": "https://www.youtube.com/@AndreiJikh" },
+    { "name": "Graham Stephan", "handle": "GrahamStephan", "url": "https://www.youtube.com/@GrahamStephan" },
+    { "name": "whynottv1999", "handle": "whynottv1999", "url": "https://www.youtube.com/@whynottv1999" }
   ],
   "x_accounts": [
     { "name": "Andrej Karpathy", "handle": "karpathy" },
